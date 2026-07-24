@@ -24,7 +24,8 @@ else:
     _APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
 DEFAULT_CSV_PATH = os.path.join(_APP_DIR, "leakage_measurements.csv")
-CSV_HEADER = ["timestamp", "pol_voltage_V", "pol_delay_s", "pol_current_A", "leak_voltage_V", "leak_delay_s", "leak_current_A"]
+DEFAULT_RESULTS_CSV_PATH = os.path.join(_APP_DIR, "leakage_results.csv")
+CSV_HEADER = ["timestamp", "run_id", "wafer_id", "die_id", "nplc", "pol_voltage_V", "pol_delay_s", "pol_current_A", "pol_current_nA", "leak_voltage_V", "leak_delay_s", "leak_current_A", "leak_current_nA"]
 
 
 class LeakageGUI(tk.Tk):
@@ -32,6 +33,7 @@ class LeakageGUI(tk.Tk):
         super().__init__()
         self.title("Polarization / Leakage Measurement")
         self.resizable(True, True)
+        self.geometry("1150x680")
         self.instrument = None
         self.history = [] #csv data
         self._liveLeakReading = None #continuous measurement of leakage
@@ -39,7 +41,9 @@ class LeakageGUI(tk.Tk):
         self._continuousStopEvent = None #To stop the continous thread(event here)
         self._plotBuffer = deque() #points for the live plot, only keep last PLOT_WINDOW_S seconds
         self._uiQueue = queue.Queue() #worker threads put stuff here, only the main loop reads it (tkinter is not thread safe)
+        self._loopRunCounter = 0 #same id for every row written by one loop test run
 
+        self._build_scrollable_container()
 
         self._build_connection_frame()
         self._build_params_frame() #set default values
@@ -54,8 +58,27 @@ class LeakageGUI(tk.Tk):
 
     #UI construction #######################
 
+    def _build_scrollable_container(self):
+        self.grid_rowconfigure(0, weight=1)
+        self.grid_columnconfigure(0, weight=1)
+
+        canvas = tk.Canvas(self, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(self, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+
+        self.mainFrame = ttk.Frame(canvas)
+        mainFrameWindow = canvas.create_window((0, 0), window=self.mainFrame, anchor="nw")
+        self.mainFrame.grid_columnconfigure(1, weight=1)
+        self.mainFrame.grid_rowconfigure(3, weight=1)
+
+        self.mainFrame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(mainFrameWindow, width=e.width, height=max(e.height, self.mainFrame.winfo_reqheight())))
+        canvas.bind_all("<MouseWheel>", lambda e: canvas.yview_scroll(int(-e.delta / 120), "units"))
+
     def _build_connection_frame(self):
-        frame = ttk.LabelFrame(self, text="Instrument connection")
+        frame = ttk.LabelFrame(self.mainFrame, text="Instrument connection")
         frame.grid(row=0, column=0, padx=10, pady=8, sticky="ew")
 
         ttk.Label(frame, text="VISA resource:").grid(row=0, column=0, padx=5, pady=5, sticky="w")
@@ -73,17 +96,17 @@ class LeakageGUI(tk.Tk):
         ttk.Label(frame, textvariable=self.connStatusVar, foreground="grey").grid(row=1, column=0, columnspan=5, padx=5, pady=(0, 5), sticky="w")
 
     def _build_params_frame(self):
-        frame = ttk.LabelFrame(self, text="Sequence parameters")
+        frame = ttk.LabelFrame(self.mainFrame, text="Sequence parameters")
         frame.grid(row=1, column=0, padx=10, pady=8, sticky="ew")
 
         self.polVoltageVar = tk.DoubleVar(value=20.0)
         self.polDelayVar = tk.DoubleVar(value=0.1)
         self.leakVoltageVar = tk.DoubleVar(value=10.0)
         self.leakDelayVar = tk.DoubleVar(value=0.4)
-        self.limitEnabledVar = tk.BooleanVar(value=False)
-        self.currentLimitMaVar = tk.DoubleVar(value=10.0)
-        self.nplcVar = tk.DoubleVar(value=0.1)
-        self.rangeEnabledVar = tk.BooleanVar(value=False)
+        self.limitEnabledVar = tk.BooleanVar(value=True)
+        self.currentLimitMaVar = tk.DoubleVar(value=0.001)
+        self.nplcVar = tk.DoubleVar(value=1.0)
+        self.rangeEnabledVar = tk.BooleanVar(value=True)
         self.currentRangeAVar = tk.DoubleVar(value=1e-6)
 
         def row(r, label, var, unit):
@@ -97,7 +120,7 @@ class LeakageGUI(tk.Tk):
         row(3, "Leakage measurement delay", self.leakDelayVar, "s")
 
         ttk.Checkbutton(frame, text="Limit", variable=self.limitEnabledVar, command=self._toggle_current_limit).grid(row=4, column=0, columnspan=2, padx=5, pady=4, sticky="w")
-        self.currentLimitEntry = ttk.Entry(frame, textvariable=self.currentLimitMaVar, width=10, state="disabled")
+        self.currentLimitEntry = ttk.Entry(frame, textvariable=self.currentLimitMaVar, width=10, state="normal" if self.limitEnabledVar.get() else "disabled")
         self.currentLimitEntry.grid(row=4, column=1, padx=5, pady=4, sticky="e")
         ttk.Label(frame, text="mA (limit)").grid(row=4, column=2, padx=5, pady=4, sticky="w")
 
@@ -105,7 +128,7 @@ class LeakageGUI(tk.Tk):
         row(5, "NPLC", self.nplcVar, "cycles (setup)")
 
         ttk.Checkbutton(frame, text="Fixed current range", variable=self.rangeEnabledVar, command=self._toggle_current_range).grid(row=6, column=0, columnspan=2, padx=5, pady=4, sticky="w")
-        self.currentRangeEntry = ttk.Entry(frame, textvariable=self.currentRangeAVar, width=10, state="disabled")
+        self.currentRangeEntry = ttk.Entry(frame, textvariable=self.currentRangeAVar, width=10, state="normal" if self.rangeEnabledVar.get() else "disabled")
         self.currentRangeEntry.grid(row=6, column=1, padx=5, pady=4, sticky="e")
         ttk.Label(frame, text="A (range, setup)").grid(row=6, column=2, padx=5, pady=4, sticky="w")
 
@@ -115,33 +138,94 @@ class LeakageGUI(tk.Tk):
     def _toggle_current_range(self):
         self.currentRangeEntry.configure(state="normal" if self.rangeEnabledVar.get() else "disabled")
 
+    def _toggle_pre_pause(self):
+        self.prePauseEntry.configure(state="normal" if self.prePauseEnabledVar.get() else "disabled")
+
+    def _get_pre_pause(self):
+        return self.prePauseSecVar.get() if self.prePauseEnabledVar.get() else 0.0
+
     def _build_csv_frame(self):
-        frame = ttk.LabelFrame(self, text="CSV logging")
+        frame = ttk.LabelFrame(self.mainFrame, text="CSV logging")
         frame.grid(row=2, column=0, padx=10, pady=8, sticky="ew")
 
+        ttk.Label(frame, text="Loop samples").grid(row=0, column=0, padx=5, pady=5, sticky="w")
         self.csvPathVar = tk.StringVar(value=DEFAULT_CSV_PATH)
-        ttk.Entry(frame, textvariable=self.csvPathVar, width=45).grid(row=0, column=0, padx=5, pady=5)
-        ttk.Button(frame, text="Browse...", command=self._browse_csv).grid(row=0, column=1, padx=5, pady=5)
+        ttk.Entry(frame, textvariable=self.csvPathVar, width=45).grid(row=0, column=1, padx=5, pady=5)
+        ttk.Button(frame, text="Browse...", command=self._browse_csv).grid(row=0, column=2, padx=5, pady=5)
+        ttk.Button(frame, text="Clear", command=self._on_clear_csv).grid(row=0, column=3, padx=5, pady=5)
+
+        ttk.Label(frame, text="Results").grid(row=1, column=0, padx=5, pady=5, sticky="w")
+        self.resultsCsvPathVar = tk.StringVar(value=DEFAULT_RESULTS_CSV_PATH)
+        ttk.Entry(frame, textvariable=self.resultsCsvPathVar, width=45).grid(row=1, column=1, padx=5, pady=5)
+        ttk.Button(frame, text="Browse...", command=self._browse_results_csv).grid(row=1, column=2, padx=5, pady=5)
+        ttk.Button(frame, text="Clear", command=self._on_clear_results_csv).grid(row=1, column=3, padx=5, pady=5)
 
     def _build_action_frame(self):
-        frame = ttk.Frame(self)
-        frame.grid(row=3, column=0, padx=10, pady=8, sticky="ew")
+        container = ttk.Frame(self.mainFrame)
+        container.grid(row=3, column=0, padx=10, pady=8, sticky="ew")
 
-        self.startButton = ttk.Button(frame, text="Start", command=self._on_start, state="disabled")
-        self.startButton.grid(row=0, column=0, padx=5)
+        startFrame = ttk.LabelFrame(container, text="Single measurement")
+        startFrame.grid(row=0, column=0, sticky="ew")
 
-        self.continuousButton = ttk.Button(frame, text="Continuous", command=self._on_toggle_continuous, state="disabled")
-        self.continuousButton.grid(row=0, column=1, padx=5)
+        self.startButton = ttk.Button(startFrame, text="Start", command=self._on_start, state="disabled")
+        self.startButton.grid(row=0, column=0, padx=5, pady=5)
 
-        self.storeButton = ttk.Button(frame, text="Store reading", command=self._on_store, state="disabled")
-        self.storeButton.grid(row=0, column=2, padx=5)
+        self.continuousButton = ttk.Button(startFrame, text="Continuous", command=self._on_toggle_continuous, state="disabled")
+        self.continuousButton.grid(row=0, column=1, padx=5, pady=5)
+
+        self.storeButton = ttk.Button(startFrame, text="Store reading", command=self._on_store, state="disabled")
+        self.storeButton.grid(row=0, column=2, padx=5, pady=5)
 
         self.statusVar = tk.StringVar(value="Ready")
-        ttk.Label(frame, textvariable=self.statusVar).grid(row=0, column=3, padx=10, sticky="w")
+        ttk.Label(startFrame, textvariable=self.statusVar).grid(row=0, column=3, padx=10, pady=5, sticky="w")
+
+        self.startWaferIdVar = tk.StringVar(value="")
+        ttk.Label(startFrame, text="Wafer ID").grid(row=1, column=0, padx=5, pady=(0, 5), sticky="w")
+        ttk.Entry(startFrame, textvariable=self.startWaferIdVar, width=10).grid(row=1, column=1, padx=5, pady=(0, 5), sticky="w")
+
+        self.startDieIdVar = tk.StringVar(value="")
+        ttk.Label(startFrame, text="Die ID").grid(row=1, column=2, padx=5, pady=(0, 5), sticky="w")
+        ttk.Entry(startFrame, textvariable=self.startDieIdVar, width=10).grid(row=1, column=3, padx=5, pady=(0, 5), sticky="w")
+
+        loopFrame = ttk.LabelFrame(container, text="Loop test")
+        loopFrame.grid(row=1, column=0, sticky="ew", pady=(14, 0))
+
+        self.loopDurationVar = tk.DoubleVar(value=5.0)
+        ttk.Label(loopFrame, text="Duration").grid(row=0, column=0, padx=5, pady=5, sticky="w")
+        ttk.Entry(loopFrame, textvariable=self.loopDurationVar, width=10).grid(row=0, column=1, padx=5, pady=5, sticky="w")
+        ttk.Label(loopFrame, text="s").grid(row=0, column=2, padx=5, pady=5, sticky="w")
+
+        self.loopRepeatVar = tk.IntVar(value=10)
+        ttk.Label(loopFrame, text="Repeats").grid(row=0, column=4, padx=5, pady=5, sticky="w")
+        ttk.Entry(loopFrame, textvariable=self.loopRepeatVar, width=6).grid(row=0, column=5, padx=5, pady=5, sticky="w")
+
+        self.loopTestButton = ttk.Button(loopFrame, text="Loop test", command=self._on_loop_test, state="disabled")
+        self.loopTestButton.grid(row=0, column=6, padx=5, pady=5, sticky="w")
+
+        self.loopWaferIdVar = tk.StringVar(value="")
+        ttk.Label(loopFrame, text="Wafer ID").grid(row=1, column=0, padx=5, pady=(0, 5), sticky="w")
+        ttk.Entry(loopFrame, textvariable=self.loopWaferIdVar, width=10).grid(row=1, column=1, padx=5, pady=(0, 5), sticky="w")
+
+        self.loopDieIdVar = tk.StringVar(value="")
+        ttk.Label(loopFrame, text="Die ID").grid(row=1, column=2, padx=5, pady=(0, 5), sticky="w")
+        ttk.Entry(loopFrame, textvariable=self.loopDieIdVar, width=10).grid(row=1, column=3, padx=5, pady=(0, 5), sticky="w")
+
+        self.prePauseEnabledVar = tk.BooleanVar(value=True)
+        self.prePauseSecVar = tk.DoubleVar(value=3.0)
+        ttk.Checkbutton(loopFrame, text="Pause before polarization", variable=self.prePauseEnabledVar, command=self._toggle_pre_pause).grid(row=2, column=0, columnspan=3, padx=5, pady=(0, 5), sticky="w")
+        self.prePauseEntry = ttk.Entry(loopFrame, textvariable=self.prePauseSecVar, width=10, state="normal" if self.prePauseEnabledVar.get() else "disabled")
+        self.prePauseEntry.grid(row=3, column=1, padx=5, pady=(0, 5), sticky="w")
+        ttk.Label(loopFrame, text="s (before each polarization)").grid(row=3, column=2, columnspan=3, padx=5, pady=(0, 5), sticky="w")
 
     def _build_results_frame(self):
-        frame = ttk.LabelFrame(self, text="Results")
-        frame.grid(row=4, column=0, padx=10, pady=8, sticky="ew")
+        self.rightFrame = ttk.Frame(self.mainFrame)
+        self.rightFrame.grid(row=0, column=1, rowspan=4, padx=10, pady=8, sticky="nsew")
+        self.rightFrame.grid_columnconfigure(0, weight=1)
+        self.rightFrame.grid_rowconfigure(1, weight=1)
+
+        frame = ttk.LabelFrame(self.rightFrame, text="Results")
+        frame.grid(row=0, column=0, sticky="ew")
+        frame.grid_columnconfigure(0, weight=1)
 
         self.showNaVar = tk.BooleanVar(value=False)
         ttk.Checkbutton(frame, text="Show in nA", variable=self.showNaVar, command=self._refresh_display).grid(row=0, column=0, padx=5, pady=4, sticky="w")
@@ -155,12 +239,14 @@ class LeakageGUI(tk.Tk):
         self.tree = ttk.Treeview(frame, columns=columns, show="headings", height=6)
         for col in columns:
             self.tree.column(col, width=110, anchor="center")
-        self.tree.grid(row=3, column=0, padx=5, pady=8)
+        self.tree.grid(row=3, column=0, padx=5, pady=8, sticky="ew")
         self._update_tree_headings()
 
     def _build_plot_frame(self):
-        frame = ttk.LabelFrame(self, text="Live plot (continuous mode, last 60 s)")
-        frame.grid(row=5, column=0, padx=10, pady=8, sticky="ew")
+        frame = ttk.LabelFrame(self.rightFrame, text="Live plot (continuous mode, last 60 s)")
+        frame.grid(row=1, column=0, pady=(8, 0), sticky="nsew")
+        frame.grid_columnconfigure(0, weight=1)
+        frame.grid_rowconfigure(0, weight=1)
 
         self._fig = Figure(figsize=(5.4, 2.8), dpi=80)
         self._axVoltage = self._fig.add_subplot(111)
@@ -177,7 +263,7 @@ class LeakageGUI(tk.Tk):
         self._fig.tight_layout()
 
         self._plotCanvas = FigureCanvasTkAgg(self._fig, master=frame)
-        self._plotCanvas.get_tk_widget().grid(row=0, column=0, padx=5, pady=5)
+        self._plotCanvas.get_tk_widget().grid(row=0, column=0, padx=5, pady=5, sticky="nsew")
 
     def _record_plot_point(self, voltage, current):
         self._plotBuffer.append((time.time(), voltage, current))
@@ -254,6 +340,14 @@ class LeakageGUI(tk.Tk):
             self._update_continuous_reading(message[1], message[2])
         elif kind == "continuous_error":
             self._on_continuous_error(message[1])
+        elif kind == "leak_sample":
+            self._on_leak_sample(*message[1:])
+        elif kind == "leak_result":
+            self._on_leak_result(*message[1:])
+        elif kind == "loop_test_done":
+            self._on_loop_test_done()
+        elif kind == "loop_test_error":
+            self._on_loop_test_error(message[1])
 
     #connection handling #######################
 
@@ -297,6 +391,7 @@ class LeakageGUI(tk.Tk):
         self.disconnectButton.configure(state="normal")
         self.startButton.configure(state="normal")
         self.continuousButton.configure(state="normal")
+        self.loopTestButton.configure(state="normal")
 
     def _on_disconnect(self):
         self._stop_continuous()
@@ -309,6 +404,7 @@ class LeakageGUI(tk.Tk):
         self.startButton.configure(state="disabled")
         self.continuousButton.configure(state="disabled")
         self.storeButton.configure(state="disabled")
+        self.loopTestButton.configure(state="disabled")
 
     def _on_close(self):
         self._on_disconnect()
@@ -321,14 +417,38 @@ class LeakageGUI(tk.Tk):
         if path:
             self.csvPathVar.set(path)
 
-    def _append_csv(self, row):
-        path = self.csvPathVar.get()
+    def _browse_results_csv(self):
+        path = filedialog.asksaveasfilename(defaultextension=".csv", initialfile=os.path.basename(self.resultsCsvPathVar.get()), filetypes=[("CSV", "*.csv")])
+        if path:
+            self.resultsCsvPathVar.set(path)
+
+    def _on_clear_csv(self):
+        self._clear_csv(self.csvPathVar.get(), "Loop samples")
+
+    def _on_clear_results_csv(self):
+        self._clear_csv(self.resultsCsvPathVar.get(), "Results")
+
+    def _clear_csv(self, path, label):
+        if not path:
+            return
+        if not messagebox.askyesno("Clear CSV", f"Delete all rows in the {label} CSV?\n{path}"):
+            return
+        try:
+            with open(path, "w", newline="") as f:
+                csv.writer(f).writerow(CSV_HEADER)
+        except OSError as exc:
+            messagebox.showerror("Clear failed", str(exc))
+
+    def _append_csv(self, path, row):
         writeHeader = not os.path.exists(path)
         with open(path, "a", newline="") as f:
             writer = csv.writer(f)
             if writeHeader:
                 writer.writerow(CSV_HEADER)
             writer.writerow(["" if v is None else v for v in row])
+
+    def _to_na(self, amps):
+        return amps * 1e9 if amps is not None else None
 
     #measurement #######################
 
@@ -347,6 +467,7 @@ class LeakageGUI(tk.Tk):
 
         self.startButton.configure(state="disabled")
         self.continuousButton.configure(state="disabled")
+        self.loopTestButton.configure(state="disabled")
         self.statusVar.set("Running...")
 
         thread = threading.Thread(target=self._run_sequence, args=(polVoltage, polDelay, leakVoltage, leakDelay, currentLimit), daemon=True)
@@ -370,20 +491,117 @@ class LeakageGUI(tk.Tk):
         self.history.append(row)
         self._refresh_display()
 
+        timestamp, polVoltage, polDelay, polCurrent, leakVoltage, leakDelay, leakCurrent = row
+        csvRow = [timestamp, None, self.startWaferIdVar.get(), self.startDieIdVar.get(), self.nplcVar.get(), polVoltage, polDelay, polCurrent, self._to_na(polCurrent), leakVoltage, leakDelay, leakCurrent, self._to_na(leakCurrent)]
         try:
-            self._append_csv(row)
+            self._append_csv(self.resultsCsvPathVar.get(), csvRow)
         except OSError as exc:
             messagebox.showerror("CSV write failed", str(exc))
 
         self.statusVar.set("Done.")
         self.startButton.configure(state="normal")
         self.continuousButton.configure(state="normal")
+        self.loopTestButton.configure(state="normal")
+
+    def _on_leak_sample(self, timestamp, runId, waferId, dieId, nplc, leakVoltage, leakDelay, current):
+        row = [datetime.fromtimestamp(timestamp).isoformat(timespec="milliseconds"), runId, waferId, dieId, nplc, None, None, None, None, leakVoltage, leakDelay, current, self._to_na(current)]
+        try:
+            self._append_csv(self.csvPathVar.get(), row)
+        except OSError as exc:
+            messagebox.showerror("CSV write failed", str(exc))
+
+    def _on_leak_result(self, timestamp, runId, waferId, dieId, nplc, polVoltage, polDelay, polCurrent, leakVoltage, leakDelay, current):
+        row = [datetime.fromtimestamp(timestamp).isoformat(timespec="milliseconds"), runId, waferId, dieId, nplc, polVoltage, polDelay, polCurrent, self._to_na(polCurrent), leakVoltage, leakDelay, current, self._to_na(current)]
+        try:
+            self._append_csv(self.resultsCsvPathVar.get(), row)
+        except OSError as exc:
+            messagebox.showerror("CSV write failed", str(exc))
 
     def _on_sequence_error(self, exc):
         self.statusVar.set("Error.")
         messagebox.showerror("Measurement error", str(exc))
         self.startButton.configure(state="normal")
         self.continuousButton.configure(state="normal")
+        self.loopTestButton.configure(state="normal")
+
+    #loop test #######################
+
+    def _on_loop_test(self):
+        if not self.instrument:
+            return
+        try:
+            polVoltage = self.polVoltageVar.get()
+            polDelay = self.polDelayVar.get()
+            leakVoltage = self.leakVoltageVar.get()
+            leakDelay = self.leakDelayVar.get()
+            currentLimit = self.currentLimitMaVar.get() / 1000.0 if self.limitEnabledVar.get() else None
+            duration = self.loopDurationVar.get()
+            repeats = self.loopRepeatVar.get()
+            nplc = self.nplcVar.get()
+            prePause = self._get_pre_pause()
+        except tk.TclError:
+            messagebox.showerror("Bad value", "Check the numbers")
+            return
+        if repeats < 1:
+            messagebox.showerror("Bad value", "Repeats must be at least 1")
+            return
+
+        waferId = self.loopWaferIdVar.get()
+        dieId = self.loopDieIdVar.get()
+
+        self.startButton.configure(state="disabled")
+        self.continuousButton.configure(state="disabled")
+        self.loopTestButton.configure(state="disabled")
+        self.statusVar.set("Loop test running...")
+
+        thread = threading.Thread(target=self._run_loop_test_repeats, args=(polVoltage, polDelay, leakVoltage, leakDelay, currentLimit, duration, repeats, waferId, dieId, nplc, prePause), daemon=True)
+        thread.start()
+
+    def _run_loop_test_repeats(self, polVoltage, polDelay, leakVoltage, leakDelay, currentLimit, duration, repeats, waferId, dieId, nplc, prePause):
+        def progress(msg):
+            self._uiQueue.put(("status", msg))
+
+        for i in range(repeats):
+            progress(f"Loop test running... ({i + 1}/{repeats})")
+            self._loopRunCounter += 1
+            runId = self._loopRunCounter
+            try:
+                self._run_loop_test(polVoltage, polDelay, leakVoltage, leakDelay, currentLimit, duration, runId, waferId, dieId, nplc, prePause, progress)
+            except Exception as exc:
+                self._uiQueue.put(("loop_test_error", exc))
+                return
+
+        self._uiQueue.put(("loop_test_done", None))
+
+    def _run_loop_test(self, polVoltage, polDelay, leakVoltage, leakDelay, currentLimit, duration, runId, waferId, dieId, nplc, prePause, progress):
+        loopStart = time.time()
+        polCurrent, samples, bestSample, endSample = self.instrument.run_loop_test(
+            polVoltage, polDelay, leakVoltage, leakDelay, duration,
+            currentLimit=currentLimit, prePause=prePause, progress=progress,
+        )
+
+        for elapsed, current in samples:
+            self._uiQueue.put(("leak_sample", loopStart + elapsed, runId, waferId, dieId, nplc, leakVoltage, elapsed, current))
+
+        if bestSample is not None:
+            elapsed, current = bestSample
+            self._uiQueue.put(("leak_result", loopStart + elapsed, runId, waferId, dieId, nplc, polVoltage, polDelay, polCurrent, leakVoltage, leakDelay, current))
+        if endSample is not None:
+            elapsed, current = endSample
+            self._uiQueue.put(("leak_result", loopStart + elapsed, runId, waferId, dieId, nplc, polVoltage, polDelay, polCurrent, leakVoltage, duration, current))
+
+    def _on_loop_test_done(self):
+        self.statusVar.set("Loop test done.")
+        self.startButton.configure(state="normal")
+        self.continuousButton.configure(state="normal")
+        self.loopTestButton.configure(state="normal")
+
+    def _on_loop_test_error(self, exc):
+        self.statusVar.set("Error.")
+        messagebox.showerror("Loop test error", str(exc))
+        self.startButton.configure(state="normal")
+        self.continuousButton.configure(state="normal")
+        self.loopTestButton.configure(state="normal")
 
     #continuous mode #######################
 
@@ -463,8 +681,9 @@ class LeakageGUI(tk.Tk):
         self.history.append(row)
         self._refresh_display()
 
+        csvRow = [timestamp, None, None, None, self.nplcVar.get(), None, None, None, None, leakVoltage, self.leakDelayVar.get(), leakCurrent, self._to_na(leakCurrent)]
         try:
-            self._append_csv(row)
+            self._append_csv(self.csvPathVar.get(), csvRow)
         except OSError as exc:
             messagebox.showerror("CSV write failed", str(exc))
 

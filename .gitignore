@@ -5,3 +5,12 @@ build/
 dist/
 .idea/
 *.spec.bak
+
+bianca_code.py
+O11406_10_*.csv
+
+cg_cgk_analysis.py
+cg_cgk_results.csv
+
+leakage_results.csv
+note.txt
